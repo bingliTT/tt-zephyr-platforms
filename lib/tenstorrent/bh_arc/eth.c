@@ -12,6 +12,10 @@
 #include "read_only_table.h"
 #include "fw_table.h"
 #include "efuse.h"
+#include "eth.h"
+#include "harvesting.h"
+#include <zephyr/logging/log.h>
+LOG_MODULE_REGISTER(eth, CONFIG_TT_APP_LOG_LEVEL);
 
 #define ETH_SETUP_TLB  0
 #define ETH_PARAM_ADDR 0x7c000
@@ -185,7 +189,7 @@ int LoadEthFw(uint32_t eth_inst, uint32_t ring, uint8_t *fw_image, uint32_t fw_s
 	bool dma_pass = ArcDmaTransfer(fw_image, (void *)eth_tlb, fw_size);
 
 	if (!dma_pass) {
-		return -1;
+		return -EACCES;
 	}
 
 	SetupEthTlb(eth_inst, ring, ETH_RESET_PC_0);
@@ -195,15 +199,6 @@ int LoadEthFw(uint32_t eth_inst, uint32_t ring, uint8_t *fw_image, uint32_t fw_s
 	return 0;
 }
 
-/**
- * @brief Load the ETH FW configuration data into ETH L1 memory
- * @param eth_inst ETH instance to load the FW config for
- * @param ring Load over NOC 0 or NOC 1
- * @param eth_enabled Bitmask of enabled ETH instances
- * @param fw_cfg_image Pointer to the FW config data
- * @param fw_cfg_size Size of the FW config data
- * @return int 0 on success, -1 on failure
- */
 int LoadEthFwCfg(uint32_t eth_inst, uint32_t ring, uint32_t eth_enabled,
 	uint8_t *fw_cfg_image, uint32_t fw_cfg_size)
 {
@@ -235,7 +230,89 @@ int LoadEthFwCfg(uint32_t eth_inst, uint32_t ring, uint32_t eth_enabled,
 	bool dma_pass = ArcDmaTransfer(fw_cfg_image, (void *)eth_tlb, fw_cfg_size);
 
 	if (!dma_pass) {
-		return -1;
+		return -EACCES;
+	}
+
+	return 0;
+}
+
+int sendEthMessage(uint32_t eth_inst, uint32_t ring, uint32_t msg, uint32_t arg0, uint32_t arg1,
+	uint32_t arg2, uint32_t timeout_ms)
+{
+	/* ETH messages will not work if the ETH instance is not enabled (i.e. no FW
+	 * has been loaded onto the ETH instance)
+	 */
+	if (!(tile_enable.eth_enabled & BIT(eth_inst))) {
+		LOG_ERR("ETH%02d is not enabled", eth_inst);
+		return -EINVAL;
+	}
+
+	/* Read the current message status */
+	SetupEthTlb(eth_inst, ring, ETH_CMFW_MAILBOX_ADDR);
+
+	/* Check mailbox is empty/ready */
+	uint32_t mailbox_msg = NOC2AXIRead32(ring, ETH_SETUP_TLB, ETH_CMFW_MAILBOX_ADDR);
+	uint32_t msg_status = mailbox_msg & ETH_MSG_STATUS_MASK;
+	uint32_t timeout = k_uptime_get() + timeout_ms;
+
+	while (msg_status != ETH_MSG_DONE && msg_status != 0) {
+		if (k_uptime_get() > timeout) {
+			return -ETIMEDOUT;
+		}
+		mailbox_msg = NOC2AXIRead32(ring, ETH_SETUP_TLB, ETH_CMFW_MAILBOX_ADDR);
+		msg_status = mailbox_msg & ETH_MSG_STATUS_MASK;
+	}
+
+	/* Write to the mailbox -> fill args then DMA to mailbox */
+	eth_mailbox_t eth_cmfw_mailbox; /* Mailbox to interact with */
+
+	eth_cmfw_mailbox.msg = ETH_MSG_CALL | msg;
+	eth_cmfw_mailbox.arg[0] = arg0;
+	eth_cmfw_mailbox.arg[1] = arg1;
+	eth_cmfw_mailbox.arg[2] = arg2;
+	volatile uint32_t *eth_tlb = GetTlbWindowAddr(ring, ETH_SETUP_TLB, ETH_CMFW_MAILBOX_ADDR);
+	int dma_pass = ArcDmaTransfer(
+			(void *)&eth_cmfw_mailbox, (void *)eth_tlb, sizeof(eth_mailbox_t));
+
+	if (!dma_pass) {
+		LOG_ERR("Failed to write ETH %02d mailbox", eth_inst);
+		return -EACCES;
+	}
+
+	/* Wait for the message to be serviced */
+	do {
+		if (k_uptime_get() > timeout) {
+			return -ETIMEDOUT;
+		}
+		mailbox_msg = NOC2AXIRead32(ring, ETH_SETUP_TLB, ETH_CMFW_MAILBOX_ADDR);
+		msg_status = mailbox_msg & ETH_MSG_STATUS_MASK;
+	} while (msg_status != ETH_MSG_DONE);
+
+	return 0;
+}
+
+int getEthLiveStatus(uint32_t eth_inst, uint32_t ring, eth_live_status_t *eth_live_status,
+					uint32_t timeout_ms)
+{
+	/* Send ETH message to get the live status and wait for it to be serviced */
+	int retcode = sendEthMessage(eth_inst, ring, ETH_MSG_LINK_STATUS_CHECK, 0xFFFFFFFF, 0, 0,
+								timeout_ms);
+
+	if (retcode != 0) {
+		LOG_ERR("Failed to send ETH%02d message to get live status with error %d", eth_inst,
+				retcode);
+		return retcode;
+	}
+
+	/* Read the ETH Live Status */
+	SetupEthTlb(eth_inst, ring, ETH_LIVE_STATUS_ADDR);
+	volatile uint32_t *eth_tlb = GetTlbWindowAddr(ring, ETH_SETUP_TLB, ETH_LIVE_STATUS_ADDR);
+
+	int dma_pass = ArcDmaTransfer((void *)eth_tlb, eth_live_status, sizeof(eth_live_status_t));
+
+	if (!dma_pass) {
+		LOG_ERR("Failed to read ETH%2d live status", eth_inst);
+		return -EACCES;
 	}
 
 	return 0;
