@@ -51,6 +51,10 @@ config TT_BH_ARC_I2C_TIMEOUT_DURATION
 	  remains full for this timeout, the I2C controller will attempt to recover the bus by
 	  sending 16 SCL pulses while holding SDA low.
 
+module = TT_BH_ARC
+module-str = Blackhole ARC library
+source "${ZEPHYR_BASE}/subsys/logging/Kconfig.template.log_config"
+
 #endif
 
 config TT_SMC_RECOVERY
